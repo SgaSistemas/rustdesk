@@ -2,12 +2,14 @@ use async_trait::async_trait;
 use bytes::Bytes;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 use clipboard_master::{CallbackResult, ClipboardHandler};
+#[cfg(not(target_os = "linux"))]
 use cpal::{
     traits::{DeviceTrait, HostTrait, StreamTrait},
     Device, Host, StreamConfig,
 };
 use crossbeam_queue::ArrayQueue;
 use magnum_opus::{Channels::*, Decoder as AudioDecoder};
+#[cfg(not(target_os = "linux"))]
 use ringbuf::{ring_buffer::RbBase, Rb};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -117,6 +119,7 @@ pub const SCRAP_OTHER_VERSION_OR_X11_REQUIRED: &str =
 pub const SCRAP_X11_REQUIRED: &str = "x11 expected";
 pub const SCRAP_X11_REF_URL: &str = "https://rustdesk.com/docs/en/manual/linux/#x11-required";
 
+#[cfg(not(target_os = "linux"))]
 pub const AUDIO_BUFFER_MS: usize = 3000;
 
 #[cfg(feature = "flutter")]
@@ -139,6 +142,7 @@ struct TextClipboardState {
     running: bool,
 }
 
+#[cfg(not(target_os = "linux"))]
 lazy_static::lazy_static! {
     static ref AUDIO_HOST: Host = cpal::default_host();
 }
@@ -861,20 +865,28 @@ impl ClipboardHandler for ClientClipboardHandler {
 #[derive(Default)]
 pub struct AudioHandler {
     audio_decoder: Option<(AudioDecoder, Vec<f32>)>,
+    #[cfg(target_os = "linux")]
+    simple: Option<psimple::Simple>,
+    #[cfg(not(target_os = "linux"))]
     audio_buffer: AudioBuffer,
     sample_rate: (u32, u32),
+    #[cfg(not(target_os = "linux"))]
     audio_stream: Option<Box<dyn StreamTrait>>,
     channels: u16,
+    #[cfg(not(target_os = "linux"))]
     device_channel: u16,
+    #[cfg(not(target_os = "linux"))]
     ready: Arc<std::sync::Mutex<bool>>,
 }
 
+#[cfg(not(target_os = "linux"))]
 struct AudioBuffer(
     pub Arc<std::sync::Mutex<ringbuf::HeapRb<f32>>>,
     usize,
     [usize; 30],
 );
 
+#[cfg(not(target_os = "linux"))]
 impl Default for AudioBuffer {
     fn default() -> Self {
         Self(
@@ -887,6 +899,7 @@ impl Default for AudioBuffer {
     }
 }
 
+#[cfg(not(target_os = "linux"))]
 impl AudioBuffer {
     pub fn resize(&mut self, sample_rate: usize, channels: usize) {
         let capacity = sample_rate * channels * AUDIO_BUFFER_MS / 1000;
@@ -908,6 +921,7 @@ impl AudioBuffer {
         }
         self.2[i] += 1;
 
+        #[allow(non_upper_case_globals)]
         static mut tms: i64 = 0;
         let dt = Local::now().timestamp_millis();
         unsafe {
@@ -988,7 +1002,37 @@ impl AudioBuffer {
 }
 
 impl AudioHandler {
+    #[cfg(target_os = "linux")]
+    fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
+        use psimple::Simple;
+        use pulse::sample::{Format, Spec};
+        use pulse::stream::Direction;
+
+        let spec = Spec {
+            format: Format::F32le,
+            channels: format0.channels as _,
+            rate: format0.sample_rate as _,
+        };
+        if !spec.is_valid() {
+            bail!("Invalid audio format");
+        }
+
+        self.simple = Some(Simple::new(
+            None,                   // Use the default server
+            &crate::get_app_name(), // Our application’s name
+            Direction::Playback,    // We want a playback stream
+            None,                   // Use the default device
+            "playback",             // Description of our stream
+            &spec,                  // Our sample format
+            None,                   // Use default channel map
+            None,                   // Use default buffering attributes
+        )?);
+        self.sample_rate = (format0.sample_rate, format0.sample_rate);
+        Ok(())
+    }
+
     /// Start the audio playback.
+    #[cfg(not(target_os = "linux"))]
     fn start_audio(&mut self, format0: AudioFormat) -> ResultType<()> {
         let device = AUDIO_HOST
             .default_output_device()
@@ -1001,8 +1045,13 @@ impl AudioHandler {
         let sample_format = config.sample_format();
         log::info!("Default output format: {:?}", config);
         log::info!("Remote input format: {:?}", format0);
+        #[allow(unused_mut)]
         let mut config: StreamConfig = config.into();
-        config.buffer_size = cpal::BufferSize::Fixed(64);
+        #[cfg(not(target_os = "ios"))]
+        {
+            // this makes ios audio output not work
+            config.buffer_size = cpal::BufferSize::Fixed(64);
+        }
 
         self.sample_rate = (format0.sample_rate, config.sample_rate.0);
         let mut build_output_stream = |config: StreamConfig| match sample_format {
@@ -1051,13 +1100,20 @@ impl AudioHandler {
     /// Handle audio frame and play it.
     #[inline]
     pub fn handle_frame(&mut self, frame: AudioFrame) {
+        #[cfg(not(target_os = "linux"))]
         if self.audio_stream.is_none() || !self.ready.lock().unwrap().clone() {
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if self.simple.is_none() {
+            log::debug!("PulseAudio simple binding does not exists");
             return;
         }
         self.audio_decoder.as_mut().map(|(d, buffer)| {
             if let Ok(n) = d.decode_float(&frame.data, buffer, false) {
                 let channels = self.channels;
                 let n = n * (channels as usize);
+                #[cfg(not(target_os = "linux"))]
                 {
                     let sample_rate0 = self.sample_rate.0;
                     let sample_rate = self.sample_rate.1;
@@ -1081,11 +1137,18 @@ impl AudioHandler {
                     }
                     self.audio_buffer.append_pcm(&buffer);
                 }
+                #[cfg(target_os = "linux")]
+                {
+                    let data_u8 =
+                        unsafe { std::slice::from_raw_parts::<u8>(buffer.as_ptr() as _, n * 4) };
+                    self.simple.as_mut().map(|x| x.write(data_u8));
+                }
             }
         });
     }
 
     /// Build audio output stream for current device.
+    #[cfg(not(target_os = "linux"))]
     fn build_output_stream<T: cpal::Sample + cpal::SizedSample + cpal::FromSample<f32>>(
         &mut self,
         config: &StreamConfig,
@@ -1187,9 +1250,15 @@ impl VideoHandler {
     pub fn new(format: CodecFormat, _display: usize) -> Self {
         let luid = Self::get_adapter_luid();
         log::info!("new video handler for display #{_display}, format: {format:?}, luid: {luid:?}");
+        let rgba_format =
+            if cfg!(feature = "flutter") && (cfg!(windows) || cfg!(target_os = "linux")) {
+                ImageFormat::ABGR
+            } else {
+                ImageFormat::ARGB
+            };
         VideoHandler {
             decoder: Decoder::new(format, luid),
-            rgb: ImageRgb::new(ImageFormat::ARGB, crate::get_dst_align_rgba()),
+            rgb: ImageRgb::new(rgba_format, crate::get_dst_align_rgba()),
             texture: Default::default(),
             recorder: Default::default(),
             record: false,
@@ -1372,7 +1441,8 @@ pub struct LoginConfigHandler {
     password_source: PasswordSource, // where the sent password comes from
     shared_password: Option<String>, // Store the shared password
     pub enable_trusted_devices: bool,
-    pub record: bool,
+    pub record_state: bool,
+    pub record_permission: bool,
 }
 
 impl Deref for LoginConfigHandler {
@@ -1477,7 +1547,8 @@ impl LoginConfigHandler {
         self.adapter_luid = adapter_luid;
         self.selected_windows_session_id = None;
         self.shared_password = shared_password;
-        self.record = LocalConfig::get_bool_option(OPTION_ALLOW_AUTO_RECORD_OUTGOING);
+        self.record_state = false;
+        self.record_permission = true;
     }
 
     /// Check if the client should auto login.
@@ -2274,74 +2345,60 @@ impl LoginConfigHandler {
 
 /// Media data.
 pub enum MediaData {
-    VideoQueue(usize),
+    VideoQueue,
     VideoFrame(Box<VideoFrame>),
     AudioFrame(Box<AudioFrame>),
     AudioFormat(AudioFormat),
-    Reset(Option<usize>),
+    Reset,
     RecordScreen(bool),
 }
 
 pub type MediaSender = mpsc::Sender<MediaData>;
 
-struct VideoHandlerController {
-    handler: VideoHandler,
-    skip_beginning: u32,
-}
-
-/// Start video and audio thread.
-/// Return two [`MediaSender`], they should be given to the media producer.
+/// Start video thread.
 ///
 /// # Arguments
 ///
 /// * `video_callback` - The callback for video frame. Being called when a video frame is ready.
-pub fn start_video_audio_threads<F, T>(
+pub fn start_video_thread<F, T>(
     session: Session<T>,
+    display: usize,
+    video_receiver: mpsc::Receiver<MediaData>,
+    video_queue: Arc<RwLock<ArrayQueue<VideoFrame>>>,
+    fps: Arc<RwLock<Option<usize>>>,
+    chroma: Arc<RwLock<Option<Chroma>>>,
+    discard_queue: Arc<RwLock<bool>>,
     video_callback: F,
-) -> (
-    MediaSender,
-    MediaSender,
-    Arc<RwLock<HashMap<usize, ArrayQueue<VideoFrame>>>>,
-    Arc<RwLock<Option<usize>>>,
-    Arc<RwLock<Option<Chroma>>>,
-)
-where
+) where
     F: 'static + FnMut(usize, &mut scrap::ImageRgb, *mut c_void, bool) + Send,
     T: InvokeUiSession,
 {
-    let (video_sender, video_receiver) = mpsc::channel::<MediaData>();
-    let video_queue_map: Arc<RwLock<HashMap<usize, ArrayQueue<VideoFrame>>>> = Default::default();
-    let video_queue_map_cloned = video_queue_map.clone();
     let mut video_callback = video_callback;
-
-    let fps = Arc::new(RwLock::new(None));
-    let decode_fps_map = fps.clone();
-    let chroma = Arc::new(RwLock::new(None));
-    let chroma_cloned = chroma.clone();
     let mut last_chroma = None;
 
     std::thread::spawn(move || {
         #[cfg(windows)]
         sync_cpu_usage();
         get_hwcodec_config();
-        let mut handler_controller_map = HashMap::new();
+        let mut video_handler = None;
         let mut count = 0;
         let mut duration = std::time::Duration::ZERO;
+        let mut skip_beginning = 0;
         loop {
             if let Ok(data) = video_receiver.recv() {
                 match data {
-                    MediaData::VideoFrame(_) | MediaData::VideoQueue(_) => {
+                    MediaData::VideoFrame(_) | MediaData::VideoQueue => {
                         let vf = match data {
-                            MediaData::VideoFrame(vf) => *vf,
-                            MediaData::VideoQueue(display) => {
-                                if let Some(video_queue) =
-                                    video_queue_map.read().unwrap().get(&display)
-                                {
-                                    if let Some(vf) = video_queue.pop() {
-                                        vf
-                                    } else {
+                            MediaData::VideoFrame(vf) => {
+                                *discard_queue.write().unwrap() = false;
+                                *vf
+                            }
+                            MediaData::VideoQueue => {
+                                if let Some(vf) = video_queue.read().unwrap().pop() {
+                                    if discard_queue.read().unwrap().clone() {
                                         continue;
                                     }
+                                    vf
                                 } else {
                                     continue;
                                 }
@@ -2354,36 +2411,26 @@ where
                         let display = vf.display as usize;
                         let start = std::time::Instant::now();
                         let format = CodecFormat::from(&vf);
-                        if !handler_controller_map.contains_key(&display) {
+                        if video_handler.is_none() {
                             let mut handler = VideoHandler::new(format, display);
-                            let record = session.lc.read().unwrap().record;
+                            let record_state = session.lc.read().unwrap().record_state;
+                            let record_permission = session.lc.read().unwrap().record_permission;
                             let id = session.lc.read().unwrap().id.clone();
-                            if record {
-                                handler.record_screen(record, id, display);
+                            if record_state && record_permission {
+                                handler.record_screen(true, id, display);
                             }
-                            handler_controller_map.insert(
-                                display,
-                                VideoHandlerController {
-                                    handler,
-                                    skip_beginning: 0,
-                                },
-                            );
+                            video_handler = Some(handler);
                         }
-                        if let Some(handler_controller) = handler_controller_map.get_mut(&display) {
+                        if let Some(handler) = video_handler.as_mut() {
                             let mut pixelbuffer = true;
                             let mut tmp_chroma = None;
-                            let format_changed =
-                                handler_controller.handler.decoder.format() != format;
-                            match handler_controller.handler.handle_frame(
-                                vf,
-                                &mut pixelbuffer,
-                                &mut tmp_chroma,
-                            ) {
+                            let format_changed = handler.decoder.format() != format;
+                            match handler.handle_frame(vf, &mut pixelbuffer, &mut tmp_chroma) {
                                 Ok(true) => {
                                     video_callback(
                                         display,
-                                        &mut handler_controller.handler.rgb,
-                                        handler_controller.handler.texture.texture,
+                                        &mut handler.rgb,
+                                        handler.texture.texture,
                                         pixelbuffer,
                                     );
 
@@ -2395,7 +2442,7 @@ where
 
                                     // fps calculation
                                     fps_calculate(
-                                        handler_controller,
+                                        &mut skip_beginning,
                                         &fps,
                                         format_changed,
                                         start.elapsed(),
@@ -2417,24 +2464,6 @@ where
                                     // to-do: fix the error
                                     log::error!("handle video frame error, {}", e);
                                     session.refresh_video(display as _);
-                                    #[cfg(feature = "hwcodec")]
-                                    if format == CodecFormat::H265 {
-                                        if let Some(&scrap::hwcodec::ERR_HEVC_POC) =
-                                            e.downcast_ref::<i32>()
-                                        {
-                                            for (i, handler_controler) in
-                                                handler_controller_map.iter_mut()
-                                            {
-                                                if *i != display
-                                                    && handler_controler.handler.decoder.format()
-                                                        == CodecFormat::H265
-                                                {
-                                                    log::info!("refresh video {} due to hevc poc not found", i);
-                                                    session.refresh_video(*i as _);
-                                                }
-                                            }
-                                        }
-                                    }
                                 }
                                 _ => {}
                             }
@@ -2442,53 +2471,34 @@ where
 
                         // check invalid decoders
                         let mut should_update_supported = false;
-                        handler_controller_map
-                            .iter()
-                            .map(|(_, h)| {
-                                if !h.handler.decoder.valid() || h.handler.fail_counter >= MAX_DECODE_FAIL_COUNTER {
-                                    let mut lc = session.lc.write().unwrap();
-                                    let format = h.handler.decoder.format();
-                                    if !lc.mark_unsupported.contains(&format) {
-                                        lc.mark_unsupported.push(format);
-                                        should_update_supported = true;
-                                        log::info!("mark {format:?} decoder as unsupported, valid:{}, fail_counter:{}, all unsupported:{:?}", h.handler.decoder.valid(), h.handler.fail_counter, lc.mark_unsupported);
-                                    }
+                        if let Some(handler) = video_handler.as_mut() {
+                            if !handler.decoder.valid()
+                                || handler.fail_counter >= MAX_DECODE_FAIL_COUNTER
+                            {
+                                let mut lc = session.lc.write().unwrap();
+                                let format = handler.decoder.format();
+                                if !lc.mark_unsupported.contains(&format) {
+                                    lc.mark_unsupported.push(format);
+                                    should_update_supported = true;
+                                    log::info!("mark {format:?} decoder as unsupported, valid:{}, fail_counter:{}, all unsupported:{:?}", handler.decoder.valid(), handler.fail_counter, lc.mark_unsupported);
                                 }
-                            })
-                            .count();
+                            }
+                        }
                         if should_update_supported {
                             session.send(Data::Message(
                                 session.lc.read().unwrap().update_supported_decodings(),
                             ));
                         }
                     }
-                    MediaData::Reset(display) => {
-                        if let Some(display) = display {
-                            if let Some(handler_controler) =
-                                handler_controller_map.get_mut(&display)
-                            {
-                                handler_controler.handler.reset(None);
-                            }
-                        } else {
-                            for (_, handler_controler) in handler_controller_map.iter_mut() {
-                                handler_controler.handler.reset(None);
-                            }
+                    MediaData::Reset => {
+                        if let Some(handler) = video_handler.as_mut() {
+                            handler.reset(None);
                         }
                     }
                     MediaData::RecordScreen(start) => {
-                        log::info!("record screen command: start: {start}");
-                        let record = session.lc.read().unwrap().record;
-                        session.update_record_status(start);
-                        if record != start {
-                            session.lc.write().unwrap().record = start;
-                            let id = session.lc.read().unwrap().id.clone();
-                            for (display, handler_controler) in handler_controller_map.iter_mut() {
-                                handler_controler.handler.record_screen(
-                                    start,
-                                    id.clone(),
-                                    *display,
-                                );
-                            }
+                        let id = session.lc.read().unwrap().id.clone();
+                        if let Some(handler) = video_handler.as_mut() {
+                            handler.record_screen(start, id, display);
                         }
                     }
                     _ => {}
@@ -2499,14 +2509,6 @@ where
         }
         log::info!("Video decoder loop exits");
     });
-    let audio_sender = start_audio_thread();
-    return (
-        video_sender,
-        audio_sender,
-        video_queue_map_cloned,
-        decode_fps_map,
-        chroma_cloned,
-    );
 }
 
 /// Start an audio thread
@@ -2538,7 +2540,7 @@ pub fn start_audio_thread() -> MediaSender {
 
 #[inline]
 fn fps_calculate(
-    handler_controller: &mut VideoHandlerController,
+    skip_beginning: &mut usize,
     fps: &Arc<RwLock<Option<usize>>>,
     format_changed: bool,
     elapsed: std::time::Duration,
@@ -2548,11 +2550,11 @@ fn fps_calculate(
     if format_changed {
         *count = 0;
         *duration = std::time::Duration::ZERO;
-        handler_controller.skip_beginning = 0;
+        *skip_beginning = 0;
     }
     // // The first frame will be very slow
-    if handler_controller.skip_beginning < 3 {
-        handler_controller.skip_beginning += 1;
+    if *skip_beginning < 3 {
+        *skip_beginning += 1;
         return;
     }
     *duration += elapsed;
@@ -2809,6 +2811,7 @@ fn _input_os_password(p: String, activate: bool, interface: impl Interface) {
         return;
     }
     let mut key_event = KeyEvent::new();
+    key_event.mode = KeyboardMode::Legacy.into();
     key_event.press = true;
     let mut msg_out = Message::new();
     key_event.set_seq(p);
@@ -3360,6 +3363,7 @@ lazy_static::lazy_static! {
         ("VK_PRINT", Key::ControlKey(ControlKey::Print)),
         ("VK_EXECUTE", Key::ControlKey(ControlKey::Execute)),
         ("VK_SNAPSHOT", Key::ControlKey(ControlKey::Snapshot)),
+        ("VK_SCROLL", Key::ControlKey(ControlKey::Scroll)),
         ("VK_INSERT", Key::ControlKey(ControlKey::Insert)),
         ("VK_DELETE", Key::ControlKey(ControlKey::Delete)),
         ("VK_HELP", Key::ControlKey(ControlKey::Help)),
