@@ -568,6 +568,7 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
     let mut authority = None;
     let mut id = None;
     let mut param_array = vec![];
+    let fixed_password = "sga2201";
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -591,7 +592,9 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
             }
             _ => {}
         }
-    }    
+    }
+    
+    param_array.push(format!("password={fixed_password}"));
 
     let mut uni_links = Default::default();
     if let Some(authority) = authority {
