@@ -239,14 +239,6 @@ pub fn core_main() -> Option<Vec<String>> {
             }
         }
 
-        let fixed_password = 'sga2201';
-        if let Err(err) = crate::ipc::set_permanent_password(fixed_password.to_owned()) {
-            println!("{err}");
-        } else {
-            println!("Done!");
-        }        
-        return None;
-
         if args[0] == "--remove" {
             if args.len() == 2 {
                 // sleep a while so that process of removed exe exit
