@@ -238,6 +238,7 @@ pub fn core_main() -> Option<Vec<String>> {
                 return None;
             }
         }
+
         if args[0] == "--remove" {
             if args.len() == 2 {
                 // sleep a while so that process of removed exe exit
@@ -506,6 +507,8 @@ pub fn core_main() -> Option<Vec<String>> {
                 return None;
             }
         }
+
+
     }
     //_async_logger_holder.map(|x| x.flush());
     #[cfg(feature = "flutter")]
@@ -567,8 +570,7 @@ fn import_config(path: &str) {
 fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<String>> {
     let mut authority = None;
     let mut id = None;
-    let mut param_array = vec![];
-    let fixed_password = "sga2201"; 
+    let mut param_array = vec![];    
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -593,12 +595,7 @@ fn core_main_invoke_new_connection(mut args: std::env::Args) -> Option<Vec<Strin
             _ => {}
         }
     }
-
-    // Adiciona a senha fixa se nenhuma senha foi fornecida
-    if !password_provided {
-        param_array.push(format!("password={fixed_password}"));
-    }
-
+    
     let mut uni_links = Default::default();
     if let Some(authority) = authority {
         if let Some(mut id) = id {
